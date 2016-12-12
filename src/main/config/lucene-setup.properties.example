@@ -1,0 +1,11 @@
+# Glassfish
+secure         = true
+container      = Glassfish
+home           = /home/fisher/pf/glassfish4
+port           = 4848
+
+# WildFly
+!secure         = false
+!container      = JBoss
+!home           = /home/fisher/pf/wildfly
+!port           = 9990

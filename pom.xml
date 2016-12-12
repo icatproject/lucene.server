@@ -15,6 +15,7 @@
 		<repoUrl>https://repo.icatproject.org/repo</repoUrl>
 		<project.scm.id>github</project.scm.id>
 		<gitUrl>https://github.com/icatproject/icat.lucene</gitUrl>
+		<luceneVersion>5.3.0</luceneVersion>
 	</properties>
 
 	<repositories>
@@ -61,6 +62,36 @@
 	</distributionManagement>
 
 	<dependencies>
+
+		<dependency>
+			<groupId>org.apache.lucene</groupId>
+			<artifactId>lucene-core</artifactId>
+			<version>${luceneVersion}</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.lucene</groupId>
+			<artifactId>lucene-queryparser</artifactId>
+			<version>${luceneVersion}</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.lucene</groupId>
+			<artifactId>lucene-analyzers-common</artifactId>
+			<version>${luceneVersion}</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.lucene</groupId>
+			<artifactId>lucene-join</artifactId>
+			<version>${luceneVersion}</version>
+		</dependency>
+
+		<dependency>
+			<groupId>javax</groupId>
+			<artifactId>javaee-api</artifactId>
+			<version>7.0</version>
+		</dependency>
 
 		<dependency>
 			<groupId>org.icatproject</groupId>

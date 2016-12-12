@@ -1,0 +1,6 @@
+# Real comments in this file are marked with '#' whereas commented out lines
+# are marked with '!'
+
+directory = ../data/icat/lucene
+commitSeconds = 5
+commitCount = 10000
