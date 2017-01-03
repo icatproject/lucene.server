@@ -6,15 +6,14 @@ import java.net.HttpURLConnection;
 import java.nio.file.Paths;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
@@ -23,6 +22,7 @@ import javax.json.Json;
 import javax.json.JsonArray;
 import javax.json.JsonObject;
 import javax.json.JsonReader;
+import javax.json.JsonString;
 import javax.json.JsonValue;
 import javax.json.stream.JsonGenerator;
 import javax.json.stream.JsonParser;
@@ -43,6 +43,7 @@ import org.apache.lucene.document.DateTools;
 import org.apache.lucene.document.DateTools.Resolution;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field.Store;
+import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.IndexWriter;
@@ -66,6 +67,7 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.WildcardQuery;
 import org.apache.lucene.search.join.JoinUtil;
 import org.apache.lucene.search.join.ScoreMode;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.util.BytesRef;
 import org.icatproject.lucene.exceptions.LuceneException;
@@ -79,92 +81,210 @@ import org.slf4j.MarkerFactory;
 @Singleton
 public class Lucene {
 
+	enum AttributeName {
+		type, name, value, date, store
+	}
+
+	enum FieldType {
+		TextField, StringField, SortedDocValuesField
+	}
+
+	private class IndexBucket {
+		private FSDirectory directory;
+		private IndexWriter indexWriter;
+		private SearcherManager searcherManager;
+		private Set<Long> docsToDelete = ConcurrentHashMap.newKeySet();
+		private Set<Document> docsToAdd = ConcurrentHashMap.newKeySet();
+		private AtomicBoolean locked = new AtomicBoolean();
+		public Map<Long, Document> docsToUpdate = new ConcurrentHashMap<>();
+	}
+
 	public class Search {
 		public Map<String, IndexSearcher> map;
 		public Query query;
 		public ScoreDoc lastDoc;
 	}
 
+	enum When {
+		Now, Sometime
+	}
+
 	private static final Logger logger = LoggerFactory.getLogger(Lucene.class);
+
 	private static final Marker fatal = MarkerFactory.getMarker("FATAL");
 
 	private String luceneDirectory;
+
 	private int luceneCommitMillis;
+
 	private AtomicLong bucketNum = new AtomicLong();
-
-	private class IndexBucket {
-		private FSDirectory directory;
-		private IndexWriter indexWriter;
-		private SearcherManager searcherManager;
-	}
-
 	private Map<String, IndexBucket> indexBuckets = new ConcurrentHashMap<>();
-	private Map<String, String> uniqueStrings = new ConcurrentHashMap<>();
-
 	private StandardQueryParser parser;
 
 	private Timer timer;
+
 	private IcatAnalyzer analyzer;
-	private AtomicReference<String> populatingName;
-	private Set<Document> docsToAdd = new HashSet<>();
+
 	private Map<Long, Search> searches = new ConcurrentHashMap<>();
 
-	@PreDestroy
-	private void exit() {
-		logger.info("Closing down icat.lucene");
-		timer.cancel();
-		timer = null; // This seems to be necessary to make it really stop
-		try {
-			for (IndexBucket bucket : indexBuckets.values()) {
-				bucket.searcherManager.close();
-				bucket.indexWriter.commit();
-				bucket.indexWriter.close();
-				bucket.directory.close();
-			}
-			logger.info("Closed down icat.lucene");
-		} catch (Exception e) {
-			logger.error(fatal, "Problem closing down icat.lucene", e);
+	/*
+	 * Expect an array of things to add to a single document
+	 */
+	@POST
+	@Consumes(MediaType.APPLICATION_JSON)
+	@Path("add/{entityName}")
+	public void add(@Context HttpServletRequest request, @PathParam("entityName") String entityName)
+			throws LuceneException {
+		logger.debug("Requesting add of {}", entityName);
+		try (JsonParser parser = Json.createParser(request.getInputStream())) {
+			parser.next(); // Skip the opening [
+			add(request, entityName, When.Sometime, parser, null);
+		} catch (IOException e) {
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
 	}
 
-	@PostConstruct
-	private void init() {
-		logger.info("Initialising icat.lucene");
-		CheckedProperties props = new CheckedProperties();
-		try {
-			props.loadFromFile("lucene.properties");
+	/* if id is not null this is actually an update */
+	private void add(HttpServletRequest request, String entityName, When when, JsonParser parser, Long id)
+			throws LuceneException, IOException {
 
-			luceneDirectory = props.getString("directory");
+		IndexBucket bucket = indexBuckets.computeIfAbsent(entityName, k -> createBucket(k));
 
-			luceneCommitMillis = props.getPositiveInt("commitSeconds") * 1000;
+		AttributeName attName = null;
+		FieldType fType = null;
+		String name = null;
+		String value = null;
+		Store store = Store.NO;
+		Document doc = new Document();
 
-			analyzer = new IcatAnalyzer();
-
-			parser = new StandardQueryParser();
-			StandardQueryConfigHandler qpConf = (StandardQueryConfigHandler) parser.getQueryConfigHandler();
-			qpConf.set(ConfigurationKeys.ANALYZER, analyzer);
-			qpConf.set(ConfigurationKeys.ALLOW_LEADING_WILDCARD, true);
-
-			timer = new Timer("LuceneCommitTimer");
-			timer.schedule(new TimerTask() {
-
-				@Override
-				public void run() {
+		parser.next(); // Skip the [
+		while (parser.hasNext()) {
+			Event ev = parser.next();
+			if (ev == Event.KEY_NAME) {
+				try {
+					attName = AttributeName.valueOf(parser.getString());
+				} catch (Exception e) {
+					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST,
+							"Found unknown field type " + e.getMessage());
+				}
+			} else if (ev == Event.VALUE_STRING) {
+				if (attName == AttributeName.type) {
 					try {
-						commit();
-					} catch (Throwable t) {
-						logger.error(t.getMessage());
+						fType = FieldType.valueOf(parser.getString());
+					} catch (Exception e) {
+						throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST,
+								"Found unknown field type " + e.getMessage());
+					}
+				} else if (attName == AttributeName.name) {
+					name = parser.getString();
+				} else if (attName == AttributeName.value) {
+					value = parser.getString();
+				} else {
+					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Bad VALUE_STRING " + attName);
+				}
+			} else if (ev == Event.VALUE_NUMBER) {
+				long num = parser.getLong();
+				if (attName == AttributeName.date) {
+					value = DateTools.dateToString(new Date(num), Resolution.MINUTE);
+				} else if (fType == FieldType.SortedDocValuesField) {
+					value = Long.toString(num);
+				} else {
+					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Bad VALUE_NUMBER " + attName);
+				}
+			} else if (ev == Event.VALUE_TRUE) {
+				if (attName == AttributeName.store) {
+					store = Store.YES;
+				} else {
+					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Bad VALUE_TRUE " + attName);
+				}
+			} else if (ev == Event.START_OBJECT) {
+				fType = null;
+				name = null;
+				value = null;
+				store = Store.NO;
+			} else if (ev == Event.END_OBJECT) {
+				if (fType == FieldType.TextField) {
+					doc.add(new TextField(name, value, store));
+				} else if (fType == FieldType.StringField) {
+					doc.add(new StringField(name, value, store));
+				} else if (fType == FieldType.SortedDocValuesField) {
+					doc.add(new SortedDocValuesField(name, new BytesRef(value)));
+				}
+
+			} else if (ev == Event.END_ARRAY) {
+				if (id == null) {
+					if (bucket.locked.get() && when == When.Sometime) {
+						bucket.docsToAdd.add(doc);
+						logger.trace("Will add to {} lucene index later", entityName);
+					} else {
+						bucket.indexWriter.addDocument(doc);
+					}
+				} else {
+					if (bucket.locked.get()) {
+						bucket.docsToUpdate.put(id, doc);
+					} else {
+						bucket.indexWriter.updateDocument(new Term("id", id.toString()), doc);
 					}
 				}
-			}, luceneCommitMillis, luceneCommitMillis);
-			populatingName = new AtomicReference<String>();
-
-		} catch (Exception e) {
-			logger.error(fatal, e.getMessage());
-			throw new IllegalStateException(e.getMessage());
+				return;
+			} else {
+				throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Unexpected token in Json: " + ev);
+			}
 		}
+	}
 
-		logger.info("Initialised icat.lucene");
+	/*
+	 * Expect an array of documents each encoded as an array of things to add to
+	 * the document
+	 */
+	@POST
+	@Consumes(MediaType.APPLICATION_JSON)
+	@Path("addNow/{entityName}")
+	public void addNow(@Context HttpServletRequest request, @PathParam("entityName") String entityName)
+			throws LuceneException {
+		logger.debug("Requesting addNow of {}", entityName);
+		int count = 0;
+		try (JsonParser parser = Json.createParser(request.getInputStream())) {
+			Event ev = parser.next(); // Opening [
+			while (true) {
+				ev = parser.next(); // Final ] or another document
+				if (ev == Event.END_ARRAY) {
+					break;
+				}
+				add(request, entityName, When.Now, parser, null);
+				count++;
+			}
+		} catch (IOException e) {
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+		}
+		logger.debug("Added {} {} documents", count, entityName);
+	}
+
+	/*
+	 * This is not going to work properly if other calls are being made to the
+	 * server as it grabs locks without checking.
+	 */
+	@POST
+	@Path("clear")
+	public void clear() throws LuceneException {
+		Set<Entry<String, IndexBucket>> entries = indexBuckets.entrySet();
+		logger.info("Requesting clear of {} buckets", entries.size());
+		for (Entry<String, IndexBucket> entry : entries) {
+			IndexBucket bucket = entry.getValue();
+			bucket.locked.set(true);
+			try {
+				bucket.indexWriter.deleteAll();
+			} catch (AlreadyClosedException e) {
+				logger.info("IndexWriter for {} is not currently open", entry.getKey());
+			} catch (IOException e) {
+				throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+			}
+			if (!bucket.locked.compareAndSet(true, false)) {
+				throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE,
+						"Lucene is not currently locked for " + entry.getKey());
+			}
+		}
+		commit();
 	}
 
 	@POST
@@ -173,17 +293,53 @@ public class Lucene {
 		logger.debug("Requesting commit");
 		try {
 			for (Entry<String, IndexBucket> entry : indexBuckets.entrySet()) {
-				IndexBucket bucket = entry.getValue();
-				int cached = bucket.indexWriter.numRamDocs();
-				bucket.indexWriter.commit();
-				if (cached != 0) {
-					logger.debug("Synch has committed {} {} changes to Lucene - now have {} documents indexed", cached,
-							entry.getKey(), bucket.indexWriter.numDocs());
+				try {
+					IndexBucket bucket = entry.getValue();
+					if (!bucket.locked.get()) {
+						int cached = bucket.indexWriter.numRamDocs();
+						bucket.indexWriter.commit();
+						if (cached != 0) {
+							logger.debug("Synch has committed {} {} changes to Lucene - now have {} documents indexed",
+									cached, entry.getKey(), bucket.indexWriter.numDocs());
+						}
+						bucket.searcherManager.maybeRefreshBlocking();
+					}
+				} catch (AlreadyClosedException e) {
+					logger.info("IndexWriter for {} is not currently open", entry.getKey());
 				}
-				bucket.searcherManager.maybeRefreshBlocking();
 			}
 		} catch (IOException e) {
 			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+		}
+	}
+
+	private IndexBucket createBucket(String name) {
+		try {
+			IndexBucket bucket = new IndexBucket();
+			FSDirectory directory = FSDirectory.open(Paths.get(luceneDirectory, name));
+			bucket.directory = directory;
+			logger.debug("Opened FSDirectory {}", directory);
+
+			IndexWriterConfig config = new IndexWriterConfig(analyzer);
+			IndexWriter iwriter = new IndexWriter(directory, config);
+			String[] files = directory.listAll();
+			if (files.length == 1 && files[0].equals("write.lock")) {
+				logger.debug("Directory only has the write.lock file so store and delete a dummy document");
+				Document doc = new Document();
+				doc.add(new StringField("dummy", "dummy", Store.NO));
+				iwriter.addDocument(doc);
+				iwriter.commit();
+				iwriter.deleteDocuments(new Term("dummy", "dummy"));
+				iwriter.commit();
+				logger.debug("Now have " + iwriter.numDocs() + " documents indexed");
+			}
+			bucket.indexWriter = iwriter;
+			bucket.searcherManager = new SearcherManager(iwriter, false, null);
+			logger.debug("Bucket for {} is now ready", name);
+			return bucket;
+		} catch (Throwable e) {
+			logger.error("Can't continue " + e.getClass() + " " + e.getMessage());
+			return null;
 		}
 	}
 
@@ -239,34 +395,7 @@ public class Lucene {
 					JsonArray params = o.getJsonArray("params");
 					IndexSearcher datafileParameterSearcher = getSearcher(map, "DatafileParameter");
 					for (JsonValue p : params) {
-						JsonObject parameter = (JsonObject) p;
-
-						BooleanQuery.Builder paramQuery = new BooleanQuery.Builder();
-						String pName = parameter.getString("name", null);
-						if (pName != null) {
-							paramQuery.add(new WildcardQuery(new Term("name", pName)), Occur.MUST);
-						}
-						String pUnits = parameter.getString("units", null);
-						if (pUnits != null) {
-							paramQuery.add(new WildcardQuery(new Term("units", pUnits)), Occur.MUST);
-						}
-						String pStringValue = parameter.getString("stringValue", null);
-						String pLowerDateValue = parameter.getString("lowerDateValue", null);
-						String pUpperDateValue = parameter.getString("upperDateValue", null);
-						Double pLowerNumericValue = parameter.containsKey("lowerNumericValue")
-								? parameter.getJsonNumber("lowerNumericValue").doubleValue() : null;
-						Double pUpperNumericValue = parameter.containsKey("upperNumericValue")
-								? parameter.getJsonNumber("upperNumericValue").doubleValue() : null;
-						if (pStringValue != null) {
-							paramQuery.add(new WildcardQuery(new Term("stringValue", pStringValue)), Occur.MUST);
-						} else if (pLowerDateValue != null && pUpperDateValue != null) {
-							paramQuery.add(new TermRangeQuery("dateTimeValue", new BytesRef(pLowerDateValue),
-									new BytesRef(upper), true, true), Occur.MUST);
-
-						} else if (pLowerNumericValue != null && pUpperNumericValue != null) {
-							paramQuery.add(NumericRangeQuery.newDoubleRange("numericValue", pLowerNumericValue,
-									pUpperNumericValue, true, true), Occur.MUST);
-						}
+						BooleanQuery.Builder paramQuery = parseParameter(p);
 						Query toQuery = JoinUtil.createJoinQuery("datafile", false, "id", paramQuery.build(),
 								datafileParameterSearcher, ScoreMode.None);
 						theQuery.add(toQuery, Occur.MUST);
@@ -301,43 +430,128 @@ public class Lucene {
 		}
 	}
 
-	private Query maybeEmptyQuery(Builder theQuery) {
-		Query query = theQuery.build();
-		if (query.toString().isEmpty()) {
-			query = new MatchAllDocsQuery();
+	@POST
+	@Consumes(MediaType.APPLICATION_JSON)
+	@Produces(MediaType.APPLICATION_JSON)
+	@Path("datasets")
+	public String datasets(@Context HttpServletRequest request, @QueryParam("maxResults") int maxResults)
+			throws LuceneException {
+
+		Long uid = null;
+		try {
+			uid = bucketNum.getAndIncrement();
+			Search search = new Search();
+			searches.put(uid, search);
+			Map<String, IndexSearcher> map = new HashMap<>();
+			search.map = map;
+			try (JsonReader r = Json.createReader(request.getInputStream())) {
+				JsonObject o = r.readObject();
+				String userName = o.getString("user", null);
+
+				BooleanQuery.Builder theQuery = new BooleanQuery.Builder();
+
+				if (userName != null) {
+
+					Query iuQuery = JoinUtil.createJoinQuery("investigation", false, "id",
+							new TermQuery(new Term("name", userName)), getSearcher(map, "InvestigationUser"),
+							ScoreMode.None);
+
+					Query invQuery = JoinUtil.createJoinQuery("id", false, "investigation", iuQuery,
+							getSearcher(map, "Investigation"), ScoreMode.None);
+
+					theQuery.add(invQuery, Occur.MUST);
+				}
+
+				String text = o.getString("text", null);
+				if (text != null) {
+					theQuery.add(parser.parse(text, "text"), Occur.MUST);
+				}
+
+				String lower = o.getString("lower", null);
+				String upper = o.getString("upper", null);
+				if (lower != null && upper != null) {
+					theQuery.add(new TermRangeQuery("startDate", new BytesRef(lower), new BytesRef(upper), true, true),
+							Occur.MUST);
+					theQuery.add(new TermRangeQuery("endDate", new BytesRef(lower), new BytesRef(upper), true, true),
+							Occur.MUST);
+				}
+
+				if (o.containsKey("params")) {
+					JsonArray params = o.getJsonArray("params");
+					IndexSearcher datasetParameterSearcher = getSearcher(map, "DatasetParameter");
+					for (JsonValue p : params) {
+						BooleanQuery.Builder paramQuery = parseParameter(p);
+						Query toQuery = JoinUtil.createJoinQuery("dataset", false, "id", paramQuery.build(),
+								datasetParameterSearcher, ScoreMode.None);
+						theQuery.add(toQuery, Occur.MUST);
+					}
+				}
+				search.query = maybeEmptyQuery(theQuery);
+			}
+			return luceneSearchResult("Dataset", search, maxResults, uid);
+		} catch (Exception e) {
+			logger.error("Error", e);
+			freeSearcher(uid);
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
-		logger.debug("Lucene query {}", query);
-		return query;
+
 	}
 
-	private String luceneSearchResult(String name, Search search, int maxResults, Long uid) throws IOException {
-		IndexSearcher isearcher = getSearcher(search.map, name);
-		logger.debug("To search {} {} with {} from {} ", search.query, maxResults, isearcher, search.lastDoc);
-		TopDocs topDocs = search.lastDoc == null ? isearcher.search(search.query, maxResults)
-				: isearcher.searchAfter(search.lastDoc, search.query, maxResults);
-		ScoreDoc[] hits = topDocs.scoreDocs;
-		logger.debug("Hits " + topDocs.totalHits + " maxscore " + topDocs.getMaxScore());
-		ByteArrayOutputStream baos = new ByteArrayOutputStream();
-		try (JsonGenerator gen = Json.createGenerator(baos)) {
-			gen.writeStartObject();
-			if (uid != null) {
-				gen.write("uid", uid);
+	@GET
+	@Produces(MediaType.APPLICATION_JSON)
+	@Path("datasets/{uid}")
+	public String datasetsAfter(@PathParam("uid") long uid, @QueryParam("maxResults") int maxResults)
+			throws LuceneException {
+		try {
+			Search search = searches.get(uid);
+			try {
+				return luceneSearchResult("Dataset", search, maxResults, null);
+			} catch (Exception e) {
+				throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 			}
-			gen.writeStartArray("results");
-			for (ScoreDoc hit : hits) {
-				Document doc = isearcher.doc(hit.doc);
-				gen.writeStartArray();
-				gen.write(Long.parseLong(doc.get("id")));
-				gen.write(hit.score);
-				gen.writeEnd(); // array
-			}
-			gen.writeEnd(); // array results
-			gen.writeEnd(); // object
+		} catch (Exception e) {
+			freeSearcher(uid);
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
+	}
 
-		search.lastDoc = hits.length == 0 ? null : hits[hits.length - 1];
-		logger.debug("Json returned {}", baos.toString());
-		return baos.toString();
+	@DELETE
+	@Path("delete/{entityName}/{id}")
+	public void delete(@PathParam("entityName") String entityName, @PathParam("id") long id) throws LuceneException {
+		try {
+			IndexBucket bucket = indexBuckets.computeIfAbsent(entityName, k -> createBucket(k));
+			if (bucket.locked.get()) {
+				bucket.docsToDelete.add(id);
+				logger.trace("Will delete from {} lucene index later", entityName);
+			} else {
+				bucket.indexWriter.deleteDocuments(new Term("id", Long.toString(id)));
+			}
+		} catch (IOException e) {
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+		}
+	}
+
+	@PreDestroy
+	private void exit() {
+		logger.info("Closing down icat.lucene");
+		timer.cancel();
+		timer = null; // This seems to be necessary to make it really stop
+		try {
+			for (Entry<String, IndexBucket> entry : indexBuckets.entrySet()) {
+				IndexBucket bucket = entry.getValue();
+				bucket.searcherManager.close();
+				try {
+					bucket.indexWriter.commit();
+					bucket.indexWriter.close();
+				} catch (AlreadyClosedException e) {
+					logger.info("IndexWriter for {} is not currently open", entry.getKey());
+				}
+				bucket.directory.close();
+			}
+			logger.info("Closed down icat.lucene");
+		} catch (Exception e) {
+			logger.error(fatal, "Problem closing down icat.lucene", e);
+		}
 	}
 
 	@DELETE
@@ -373,226 +587,303 @@ public class Lucene {
 		return isearcher;
 	}
 
-	enum AttributeName {
-		type, name, value, date, store
-	}
-
-	enum FieldType {
-		TextField, StringField
-	}
-
-	enum When {
-		Now, Sometime
-	}
-
-	/*
-	 * Expect an array of documents each encoded as an array of things to add to
-	 * the document
-	 */
-	@POST
-	@Consumes(MediaType.APPLICATION_JSON)
-	@Path("addNow/{entityName}")
-	public void addNow(@Context HttpServletRequest request, @PathParam("entityName") String entityName)
-			throws LuceneException {
-		logger.debug("Requesting addNow of {}", entityName);
-		lock(entityName);
-		int count = 0;
-		try (JsonParser parser = Json.createParser(request.getInputStream())) {
-			Event ev = parser.next(); // Opening [
-			while (true) {
-				ev = parser.next(); // Final ] or another document
-				if (ev == Event.END_ARRAY) {
-					break;
-				}
-				add(request, entityName, When.Now, parser);
-				count++;
-			}
-
-		} catch (IOException e) {
-			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
-		} finally {
-			unlock(entityName);
-		}
-		commit();
-		logger.debug("Added {} {} documents", count, entityName);
-	}
-
-	/*
-	 * Expect an of things to add to a single document
-	 */
-	@POST
-	@Consumes(MediaType.APPLICATION_JSON)
-	@Path("add/{entityName}")
-	public void add(@Context HttpServletRequest request, @PathParam("entityName") String entityName)
-			throws LuceneException {
-		logger.debug("Requesting add of {}", entityName);
-		try (JsonParser parser = Json.createParser(request.getInputStream())) {
-			parser.next(); // Skip the opening [
-			add(request, entityName, When.Sometime, parser);
-		} catch (IOException e) {
-			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
-		}
-	}
-
-	private void add(HttpServletRequest request, String entityName, When when, JsonParser parser)
-			throws LuceneException, IOException {
-
-		IndexWriter indexWriter = indexBuckets.computeIfAbsent(entityName, k -> createBucket(k)).indexWriter;
-
-		AttributeName attName = null;
-		FieldType fType = null;
-		String name = null;
-		String value = null;
-		Store store = Store.NO;
-		Document doc = new Document();
-
-		parser.next(); // Skip the [
-		while (parser.hasNext()) {
-			Event ev = parser.next();
-			if (ev == Event.KEY_NAME) {
-				try {
-					attName = AttributeName.valueOf(parser.getString());
-				} catch (Exception e) {
-					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST,
-							"Found unknown field type " + e.getMessage());
-				}
-			} else if (ev == Event.VALUE_STRING) {
-				if (attName == AttributeName.type) {
-					try {
-						fType = FieldType.valueOf(parser.getString());
-					} catch (Exception e) {
-						throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST,
-								"Found unknown field type " + e.getMessage());
-					}
-				} else if (attName == AttributeName.name) {
-					name = parser.getString();
-				} else if (attName == AttributeName.value) {
-					value = parser.getString();
-				} else {
-					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Bad VALUE_STRING " + attName);
-				}
-			} else if (ev == Event.VALUE_NUMBER) {
-				if (attName == AttributeName.date) {
-					value = DateTools.dateToString(new Date(parser.getLong()), Resolution.MINUTE);
-				} else {
-					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Bad VALUE_NUMBER " + attName);
-				}
-			} else if (ev == Event.VALUE_TRUE) {
-				if (attName == AttributeName.store) {
-					store = Store.YES;
-				} else {
-					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Bad VALUE_TRUE " + attName);
-				}
-			} else if (ev == Event.START_OBJECT) {
-				fType = null;
-				name = null;
-				value = null;
-				store = Store.NO;
-			} else if (ev == Event.END_OBJECT) {
-				if (fType == FieldType.TextField) {
-					doc.add(new TextField(name, value, store));
-				} else if (fType == FieldType.StringField) {
-					doc.add(new StringField(name, value, store));
-				}
-
-			} else if (ev == Event.END_ARRAY) {
-				if (entityName.equals(populatingName.get()) && when == When.Sometime) {
-					docsToAdd.add(doc);
-					logger.trace("Will add to {} lucene index later", entityName);
-				} else {
-					indexWriter.addDocument(doc);
-				}
-				return;
-			} else {
-				throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Unexpected token in Json: " + ev);
-			}
-		}
-	}
-
-	@DELETE
-	@Path("deleteAll/{entityName}")
-	public void deleteAll(@PathParam("entityName") String entityName) throws LuceneException {
-		logger.info("Requesting delete of all {}", entityName);
+	@PostConstruct
+	private void init() {
+		logger.info("Initialising icat.lucene");
+		CheckedProperties props = new CheckedProperties();
 		try {
-			indexBuckets.computeIfAbsent(entityName, k -> createBucket(k)).indexWriter.deleteAll();
-		} catch (IOException e) {
+			props.loadFromFile("lucene.properties");
+
+			luceneDirectory = props.getString("directory");
+
+			luceneCommitMillis = props.getPositiveInt("commitSeconds") * 1000;
+
+			analyzer = new IcatAnalyzer();
+
+			parser = new StandardQueryParser();
+			StandardQueryConfigHandler qpConf = (StandardQueryConfigHandler) parser.getQueryConfigHandler();
+			qpConf.set(ConfigurationKeys.ANALYZER, analyzer);
+			qpConf.set(ConfigurationKeys.ALLOW_LEADING_WILDCARD, true);
+
+			timer = new Timer("LuceneCommitTimer");
+			timer.schedule(new TimerTask() {
+
+				@Override
+				public void run() {
+					try {
+						commit();
+					} catch (Throwable t) {
+						logger.error(t.getMessage());
+					}
+				}
+			}, luceneCommitMillis, luceneCommitMillis);
+
+		} catch (Exception e) {
+			logger.error(fatal, e.getMessage());
+			throw new IllegalStateException(e.getMessage());
+		}
+
+		logger.info("Initialised icat.lucene");
+	}
+
+	@POST
+	@Consumes(MediaType.APPLICATION_JSON)
+	@Produces(MediaType.APPLICATION_JSON)
+	@Path("investigations")
+	public String investigations(@Context HttpServletRequest request, @QueryParam("maxResults") int maxResults)
+			throws LuceneException {
+		Long uid = null;
+		try {
+			uid = bucketNum.getAndIncrement();
+			Search search = new Search();
+			searches.put(uid, search);
+			Map<String, IndexSearcher> map = new HashMap<>();
+			search.map = map;
+			try (JsonReader r = Json.createReader(request.getInputStream())) {
+				JsonObject o = r.readObject();
+				String userName = o.getString("user", null);
+
+				BooleanQuery.Builder theQuery = new BooleanQuery.Builder();
+
+				if (userName != null) {
+					Query iuQuery = JoinUtil.createJoinQuery("investigation", false, "id",
+							new TermQuery(new Term("name", userName)), getSearcher(map, "InvestigationUser"),
+							ScoreMode.None);
+					theQuery.add(iuQuery, Occur.MUST);
+				}
+
+				String text = o.getString("text", null);
+				if (text != null) {
+					theQuery.add(parser.parse(text, "text"), Occur.MUST);
+				}
+
+				String lower = o.getString("lower", null);
+				String upper = o.getString("upper", null);
+				if (lower != null && upper != null) {
+					theQuery.add(new TermRangeQuery("startDate", new BytesRef(lower), new BytesRef(upper), true, true),
+							Occur.MUST);
+					theQuery.add(new TermRangeQuery("endDate", new BytesRef(lower), new BytesRef(upper), true, true),
+							Occur.MUST);
+				}
+
+				if (o.containsKey("params")) {
+					JsonArray params = o.getJsonArray("params");
+
+					IndexSearcher investigationParameterSearcher = getSearcher(map, "InvestigationParameter");
+					for (JsonValue p : params) {
+						BooleanQuery.Builder paramQuery = parseParameter(p);
+						Query toQuery = JoinUtil.createJoinQuery("investigation", false, "id", paramQuery.build(),
+								investigationParameterSearcher, ScoreMode.None);
+						theQuery.add(toQuery, Occur.MUST);
+					}
+				}
+
+				if (o.containsKey("samples")) {
+					JsonArray samples = o.getJsonArray("samples");
+					IndexSearcher sampleSearcher = getSearcher(map, "Sample");
+					for (JsonValue s : samples) {
+						JsonString sample = (JsonString) s;
+						BooleanQuery.Builder sampleQuery = new BooleanQuery.Builder();
+						sampleQuery.add(parser.parse(sample.getString(), "text"), Occur.MUST);
+						Query toQuery = JoinUtil.createJoinQuery("investigation", false, "id", sampleQuery.build(),
+								sampleSearcher, ScoreMode.None);
+						theQuery.add(toQuery, Occur.MUST);
+					}
+				}
+
+				String userFullName = o.getString("userFullName", null);
+				if (userFullName != null) {
+					BooleanQuery.Builder userFullNameQuery = new BooleanQuery.Builder();
+					userFullNameQuery.add(parser.parse(userFullName, "text"), Occur.MUST);
+					IndexSearcher investigationUserSearcher = getSearcher(map, "InvestigationUser");
+					Query toQuery = JoinUtil.createJoinQuery("investigation", false, "id", userFullNameQuery.build(),
+							investigationUserSearcher, ScoreMode.None);
+					theQuery.add(toQuery, Occur.MUST);
+				}
+
+				search.query = maybeEmptyQuery(theQuery);
+			}
+			return luceneSearchResult("Dataset", search, maxResults, uid);
+		} catch (Exception e) {
+			logger.error("Error", e);
+			freeSearcher(uid);
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+		}
+
+	}
+
+	@GET
+	@Produces(MediaType.APPLICATION_JSON)
+	@Path("investigations/{uid}")
+	public String investigationsAfter(@PathParam("uid") long uid, @QueryParam("maxResults") int maxResults)
+			throws LuceneException {
+		try {
+			Search search = searches.get(uid);
+			try {
+				return luceneSearchResult("Investigation", search, maxResults, null);
+			} catch (Exception e) {
+				throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+			}
+		} catch (Exception e) {
+			freeSearcher(uid);
 			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
 	}
 
-	// TODO Make private
 	@POST
 	@Path("lock/{entityName}")
 	public void lock(@PathParam("entityName") String entityName) throws LuceneException {
 		logger.info("Requesting lock of {} index", entityName);
-		String fixedName = uniqueStrings.computeIfAbsent(entityName, s -> s);
-		if (!populatingName.compareAndSet(null, fixedName)) {
-			throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE,
-					"Lucene already locked by " + populatingName);
+		IndexBucket bucket = indexBuckets.computeIfAbsent(entityName, k -> createBucket(k));
+
+		if (!bucket.locked.compareAndSet(false, true)) {
+			throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE, "Lucene already locked for " + entityName);
 		}
-		logger.trace("Now set to {}", populatingName);
+		try {
+			bucket.indexWriter.deleteAll();
+		} catch (AlreadyClosedException e) {
+			logger.info("IndexWriter for {} is not currently open", entityName);
+		} catch (IOException e) {
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+		}
 	}
 
-	// TODO Make private
+	private String luceneSearchResult(String name, Search search, int maxResults, Long uid) throws IOException {
+		IndexSearcher isearcher = getSearcher(search.map, name);
+		logger.debug("To search {} {} with {} from {} ", search.query, maxResults, isearcher, search.lastDoc);
+		TopDocs topDocs = search.lastDoc == null ? isearcher.search(search.query, maxResults)
+				: isearcher.searchAfter(search.lastDoc, search.query, maxResults);
+		ScoreDoc[] hits = topDocs.scoreDocs;
+		logger.debug("Hits " + topDocs.totalHits + " maxscore " + topDocs.getMaxScore());
+		ByteArrayOutputStream baos = new ByteArrayOutputStream();
+		try (JsonGenerator gen = Json.createGenerator(baos)) {
+			gen.writeStartObject();
+			if (uid != null) {
+				gen.write("uid", uid);
+			}
+			gen.writeStartArray("results");
+			for (ScoreDoc hit : hits) {
+				Document doc = isearcher.doc(hit.doc);
+				gen.writeStartArray();
+				gen.write(Long.parseLong(doc.get("id")));
+				gen.write(hit.score);
+				gen.writeEnd(); // array
+			}
+			gen.writeEnd(); // array results
+			gen.writeEnd(); // object
+		}
+
+		search.lastDoc = hits.length == 0 ? null : hits[hits.length - 1];
+		logger.debug("Json returned {}", baos.toString());
+		return baos.toString();
+	}
+
+	private Query maybeEmptyQuery(Builder theQuery) {
+		Query query = theQuery.build();
+		if (query.toString().isEmpty()) {
+			query = new MatchAllDocsQuery();
+		}
+		logger.debug("Lucene query {}", query);
+		return query;
+	}
+
+	private Builder parseParameter(JsonValue p) {
+		JsonObject parameter = (JsonObject) p;
+		BooleanQuery.Builder paramQuery = new BooleanQuery.Builder();
+		String pName = parameter.getString("name", null);
+		if (pName != null) {
+			paramQuery.add(new WildcardQuery(new Term("name", pName)), Occur.MUST);
+		}
+
+		String pUnits = parameter.getString("units", null);
+		if (pUnits != null) {
+			paramQuery.add(new WildcardQuery(new Term("units", pUnits)), Occur.MUST);
+		}
+		String pStringValue = parameter.getString("stringValue", null);
+		String pLowerDateValue = parameter.getString("lowerDateValue", null);
+		String pUpperDateValue = parameter.getString("upperDateValue", null);
+		Double pLowerNumericValue = parameter.containsKey("lowerNumericValue")
+				? parameter.getJsonNumber("lowerNumericValue").doubleValue() : null;
+		Double pUpperNumericValue = parameter.containsKey("upperNumericValue")
+				? parameter.getJsonNumber("upperNumericValue").doubleValue() : null;
+		if (pStringValue != null) {
+			paramQuery.add(new WildcardQuery(new Term("stringValue", pStringValue)), Occur.MUST);
+		} else if (pLowerDateValue != null && pUpperDateValue != null) {
+			paramQuery.add(new TermRangeQuery("dateTimeValue", new BytesRef(pLowerDateValue),
+					new BytesRef(pUpperDateValue), true, true), Occur.MUST);
+
+		} else if (pLowerNumericValue != null && pUpperNumericValue != null) {
+			paramQuery.add(NumericRangeQuery.newDoubleRange("numericValue", pLowerNumericValue, pUpperNumericValue,
+					true, true), Occur.MUST);
+		}
+		return paramQuery;
+	}
+
 	@POST
 	@Path("unlock/{entityName}")
 	public void unlock(@PathParam("entityName") String entityName) throws LuceneException {
 		logger.debug("Requesting unlock of {} index", entityName);
-		String fixedName = uniqueStrings.computeIfAbsent(entityName, s -> s);
-		if (!populatingName.compareAndSet(fixedName, null)) {
-			if (populatingName.get() == null) {
-				throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE, "Lucene is not currently locked");
+		IndexBucket bucket = indexBuckets.computeIfAbsent(entityName, k -> createBucket(k));
+		try {
+			for (Document doc : bucket.docsToAdd) {
+				bucket.indexWriter.addDocument(doc);
+			}
+			bucket.docsToAdd.clear();
+			for (Entry<Long, Document> entry : bucket.docsToUpdate.entrySet()) {
+				bucket.indexWriter.updateDocument(new Term("id", entry.getKey().toString()), entry.getValue());
+			}
+			bucket.docsToUpdate.clear();
+			for (Long id : bucket.docsToDelete) {
+				bucket.indexWriter.deleteDocuments(new Term("id", id.toString()));
+			}
+			bucket.docsToDelete.clear();
+		} catch (IOException e) {
+			try {
+				bucket.indexWriter.rollback();
+			} catch (IOException e1) {
+				logger.error("Failed to roll back a lucene unlock transaction");
+			}
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+		}
+		if (!bucket.locked.compareAndSet(true, false)) {
+			try {
+				bucket.indexWriter.rollback();
+			} catch (IOException e1) {
+				logger.error("Failed to roll back a lucene unlock transaction");
 			}
 			throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE,
-					"Lucene currently locked by " + populatingName);
+					"Lucene is not currently locked for " + entityName);
 		}
-		/* Process the ones that came in while populating */
-		// TODO - server side Class<?> klass =
-		// Class.forName(Constants.ENTITY_PREFIX +
-		// populatingClassName);
-		// for (Long id : idsToCheck) {
-		// EntityBaseBean bean = (EntityBaseBean)
-		// manager.find(klass, id);
-		// if (bean != null) {
-		// Document doc = bean.getDoc();
-		// iwriter.updateDocument(new Term("id", id.toString()),
-		// doc);
-		// } else {
-		// iwriter.deleteDocuments(new Term("id",
-		// id.toString()));
-		// }
-		// }
 
-		logger.trace("Now set to {}", populatingName);
+		try {
+			int cached = bucket.indexWriter.numRamDocs();
+			bucket.indexWriter.commit();
+			if (cached != 0) {
+				logger.debug("Unlock has committed {} {} changes to Lucene - now have {} documents indexed", cached,
+						entityName, bucket.indexWriter.numDocs());
+			}
+			bucket.searcherManager.maybeRefreshBlocking();
+		} catch (AlreadyClosedException e) {
+			logger.info("IndexWriter for {} is not currently open", entityName);
+		} catch (IOException e) {
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+		}
 	}
 
-	private IndexBucket createBucket(String name) {
-		try {
-			IndexBucket bucket = new IndexBucket();
-			FSDirectory directory = FSDirectory.open(Paths.get(luceneDirectory, name));
-			bucket.directory = directory;
-			logger.debug("Opened FSDirectory {}", directory);
-
-			IndexWriterConfig config = new IndexWriterConfig(analyzer);
-			IndexWriter iwriter = new IndexWriter(directory, config);
-			String[] files = directory.listAll();
-			if (files.length == 1 && files[0].equals("write.lock")) {
-				logger.debug("Directory only has the write.lock file so store and delete a dummy document");
-				Document doc = new Document();
-				doc.add(new StringField("dummy", "dummy", Store.NO));
-				iwriter.addDocument(doc);
-				iwriter.commit();
-				iwriter.deleteDocuments(new Term("dummy", "dummy"));
-				iwriter.commit();
-				logger.debug("Now have " + iwriter.numDocs() + " documents indexed");
-			}
-			bucket.indexWriter = iwriter;
-			bucket.searcherManager = new SearcherManager(iwriter, false, null);
-			logger.debug("Bucket for {} is now ready", name);
-			return bucket;
-		} catch (Throwable e) {
-			logger.error("Can't continue " + e.getClass() + " " + e.getMessage());
-			return null;
+	/*
+	 * Expect an array of things to update a single document
+	 */
+	@POST
+	@Consumes(MediaType.APPLICATION_JSON)
+	@Path("update/{entityName}/{id}")
+	public void update(@Context HttpServletRequest request, @PathParam("entityName") String entityName,
+			@PathParam("id") long id) throws LuceneException {
+		logger.debug("Requesting update of {}", entityName);
+		try (JsonParser parser = Json.createParser(request.getInputStream())) {
+			parser.next(); // Skip the opening [
+			add(request, entityName, When.Sometime, parser, id);
+		} catch (IOException e) {
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
 	}
 
