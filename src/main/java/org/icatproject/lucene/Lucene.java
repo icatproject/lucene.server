@@ -67,7 +67,6 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.WildcardQuery;
 import org.apache.lucene.search.join.JoinUtil;
 import org.apache.lucene.search.join.ScoreMode;
-import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.util.BytesRef;
 import org.icatproject.lucene.exceptions.LuceneException;
@@ -217,6 +216,7 @@ public class Lucene {
 						bucket.docsToAdd.add(doc);
 						logger.trace("Will add to {} lucene index later", entityName);
 					} else {
+						logger.trace("Adding {} to {} lucene index", doc, entityName);
 						bucket.indexWriter.addDocument(doc);
 					}
 				} else {
@@ -274,8 +274,6 @@ public class Lucene {
 			bucket.locked.set(true);
 			try {
 				bucket.indexWriter.deleteAll();
-			} catch (AlreadyClosedException e) {
-				logger.info("IndexWriter for {} is not currently open", entry.getKey());
 			} catch (IOException e) {
 				throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 			}
@@ -293,19 +291,15 @@ public class Lucene {
 		logger.debug("Requesting commit");
 		try {
 			for (Entry<String, IndexBucket> entry : indexBuckets.entrySet()) {
-				try {
-					IndexBucket bucket = entry.getValue();
-					if (!bucket.locked.get()) {
-						int cached = bucket.indexWriter.numRamDocs();
-						bucket.indexWriter.commit();
-						if (cached != 0) {
-							logger.debug("Synch has committed {} {} changes to Lucene - now have {} documents indexed",
-									cached, entry.getKey(), bucket.indexWriter.numDocs());
-						}
-						bucket.searcherManager.maybeRefreshBlocking();
+				IndexBucket bucket = entry.getValue();
+				if (!bucket.locked.get()) {
+					int cached = bucket.indexWriter.numRamDocs();
+					bucket.indexWriter.commit();
+					if (cached != 0) {
+						logger.debug("Synch has committed {} {} changes to Lucene - now have {} documents indexed",
+								cached, entry.getKey(), bucket.indexWriter.numDocs());
 					}
-				} catch (AlreadyClosedException e) {
-					logger.info("IndexWriter for {} is not currently open", entry.getKey());
+					bucket.searcherManager.maybeRefreshBlocking();
 				}
 			}
 		} catch (IOException e) {
@@ -540,12 +534,8 @@ public class Lucene {
 			for (Entry<String, IndexBucket> entry : indexBuckets.entrySet()) {
 				IndexBucket bucket = entry.getValue();
 				bucket.searcherManager.close();
-				try {
-					bucket.indexWriter.commit();
-					bucket.indexWriter.close();
-				} catch (AlreadyClosedException e) {
-					logger.info("IndexWriter for {} is not currently open", entry.getKey());
-				}
+				bucket.indexWriter.commit();
+				bucket.indexWriter.close();
 				bucket.directory.close();
 			}
 			logger.info("Closed down icat.lucene");
@@ -741,8 +731,6 @@ public class Lucene {
 		}
 		try {
 			bucket.indexWriter.deleteAll();
-		} catch (AlreadyClosedException e) {
-			logger.info("IndexWriter for {} is not currently open", entityName);
 		} catch (IOException e) {
 			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
@@ -838,19 +826,9 @@ public class Lucene {
 			}
 			bucket.docsToDelete.clear();
 		} catch (IOException e) {
-			try {
-				bucket.indexWriter.rollback();
-			} catch (IOException e1) {
-				logger.error("Failed to roll back a lucene unlock transaction");
-			}
 			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
 		if (!bucket.locked.compareAndSet(true, false)) {
-			try {
-				bucket.indexWriter.rollback();
-			} catch (IOException e1) {
-				logger.error("Failed to roll back a lucene unlock transaction");
-			}
 			throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE,
 					"Lucene is not currently locked for " + entityName);
 		}
@@ -863,8 +841,6 @@ public class Lucene {
 						entityName, bucket.indexWriter.numDocs());
 			}
 			bucket.searcherManager.maybeRefreshBlocking();
-		} catch (AlreadyClosedException e) {
-			logger.info("IndexWriter for {} is not currently open", entityName);
 		} catch (IOException e) {
 			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
