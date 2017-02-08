@@ -1,0 +1,81 @@
+<html>
+<head>
+<title>ICAT Lucene Server Installation</title>
+</head>
+<body>
+
+
+	<h1>
+		<a id="installation"></a> Installation
+	</h1>
+	<h2>Prerequisites</h2>
+	<ul>
+		<li>The icat lucene server distribution: <a
+			href="${repoUrl}/org/icatproject/icat.lucene/${project.version}/icat.lucene-${project.version}-distro.zip">icat.lucene-${project.version}-distro.zip</a>
+		</li>
+		<li>Java 8</li>
+		<li>A suitable deployed container. The installation scripts
+			support Glassfish and to a lesser extent WildFly. Testing has been
+			carried out with Glassfish 4.0. <a
+			href="https://icatproject.org/installation/glassfish/">Glassfish
+				installation instructions</a> are available.
+		</li>
+		<li>A database as described in <a
+			href="https://icatproject.org/installation/database/">Database
+				installation instructions</a> installed on the server
+		</li>
+
+		<li>Python (version 2.4 to 2.7)</li>
+
+	</ul>
+
+
+
+	<h2>The lucene-setup.properties file</h2>
+	<dl>
+		<dt>container</dt>
+		<dd>
+			Values must be chosen from: <a target="_blank"
+				href="http://www.eclipse.org/eclipselink/api/2.6/org/eclipse/persistence/config/TargetServer.html">TargetServer</a>
+			Though only Glassfish is working properly at the moment.
+		</dd>
+		<dt>home</dt>
+		<dd>is the top level of the container installation. For Glassfish
+			it must contain "glassfish/domains" and for JBoss (wildfly) it must
+			contain jboss-modules.jar.</dd>
+		<dt>port</dt>
+		<dd>is the administration port of the container which is
+			typically 4848 for Glassfish and 9990 for JBoss.</dd>
+		<dt>secure</dt>
+		<dd>must be set to true or false. If true then only https and not
+			http connections will be allowed.</dd>
+	</dl>
+
+	<h2>The logback.xml file</h2>
+
+	<p>If you wish to modify the provided logging levels then rename
+		logback.xml.example to logback.xml and edit to suit.</p>
+
+	<h2>The lucene.properties file</h2>
+
+	<dl>
+
+		<dt>directory</dt>
+		<dd>The path to a directory (whose parent must exist) in which to
+			store the lucene index.</dd>
+
+		<dt>commitSeconds</dt>
+		<dd>the interval in seconds between committing lucene changes to
+			disk and updating the index. If you set it to 300 then searchText()
+			calls will see what was available at some time in the past (up to 5
+			minutes ago) and which is also currently present.</dd>
+
+		<dt>commitCount</dt>
+		<dd>the number of changes to accumulate before committing them to
+			disk. If the number is too high there can be memory problems.
+			Currently this is only used by the call to lucenePopulate.</dd>
+
+	</dl>
+
+</body>
+</html>

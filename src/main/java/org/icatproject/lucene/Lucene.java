@@ -1,10 +1,13 @@
 package org.icatproject.lucene;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.net.HttpURLConnection;
+import java.nio.file.FileVisitOption;
+import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.util.Date;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -39,8 +42,6 @@ import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
 
-import org.apache.lucene.document.DateTools;
-import org.apache.lucene.document.DateTools.Resolution;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field.Store;
 import org.apache.lucene.document.SortedDocValuesField;
@@ -183,9 +184,7 @@ public class Lucene {
 				}
 			} else if (ev == Event.VALUE_NUMBER) {
 				long num = parser.getLong();
-				if (attName == AttributeName.date) {
-					value = DateTools.dateToString(new Date(num), Resolution.MINUTE);
-				} else if (fType == FieldType.SortedDocValuesField) {
+				if (fType == FieldType.SortedDocValuesField) {
 					value = Long.toString(num);
 				} else {
 					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Bad VALUE_NUMBER " + attName);
@@ -261,28 +260,32 @@ public class Lucene {
 	}
 
 	/*
-	 * This is not going to work properly if other calls are being made to the
-	 * server as it grabs locks without checking.
+	 * This is only for testing purposes. Other calls to the service will not
+	 * work properly while this operation is in progress.
 	 */
 	@POST
 	@Path("clear")
 	public void clear() throws LuceneException {
-		Set<Entry<String, IndexBucket>> entries = indexBuckets.entrySet();
-		logger.info("Requesting clear of {} buckets", entries.size());
-		for (Entry<String, IndexBucket> entry : entries) {
-			IndexBucket bucket = entry.getValue();
-			bucket.locked.set(true);
-			try {
-				bucket.indexWriter.deleteAll();
-			} catch (IOException e) {
-				throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
-			}
-			if (!bucket.locked.compareAndSet(true, false)) {
-				throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE,
-						"Lucene is not currently locked for " + entry.getKey());
-			}
+		logger.debug("Requesting clear");
+
+		exit();
+		timer = new Timer("LuceneCommitTimer");
+
+		bucketNum.set(0);
+		indexBuckets.clear();
+		searches.clear();
+
+		java.nio.file.Path dir = Paths.get(luceneDirectory);
+		try {
+			Files.walk(dir, FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder()).filter(f -> !dir.equals(f))
+					.map(java.nio.file.Path::toFile).forEach(File::delete);
+		} catch (IOException e) {
+			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+
 		}
-		commit();
+
+		timer.schedule(new CommitTimerTask(), luceneCommitMillis, luceneCommitMillis);
+
 	}
 
 	@POST
@@ -379,9 +382,9 @@ public class Lucene {
 				String lower = o.getString("lower", null);
 				String upper = o.getString("upper", null);
 				if (lower != null && upper != null) {
-					theQuery.add(new TermRangeQuery("date", new BytesRef(lower), new BytesRef(upper), true, true),
+					theQuery.add(new TermRangeQuery("startDate", new BytesRef(lower), new BytesRef(upper), true, true),
 							Occur.MUST);
-					theQuery.add(new TermRangeQuery("date", new BytesRef(lower), new BytesRef(upper), true, true),
+					theQuery.add(new TermRangeQuery("endDate", new BytesRef(lower), new BytesRef(upper), true, true),
 							Occur.MUST);
 				}
 
@@ -528,8 +531,11 @@ public class Lucene {
 	@PreDestroy
 	private void exit() {
 		logger.info("Closing down icat.lucene");
-		timer.cancel();
-		timer = null; // This seems to be necessary to make it really stop
+
+		if (timer != null) {
+			timer.cancel();
+			timer = null; // This seems to be necessary to make it really stop
+		}
 		try {
 			for (Entry<String, IndexBucket> entry : indexBuckets.entrySet()) {
 				IndexBucket bucket = entry.getValue();
@@ -596,17 +602,7 @@ public class Lucene {
 			qpConf.set(ConfigurationKeys.ALLOW_LEADING_WILDCARD, true);
 
 			timer = new Timer("LuceneCommitTimer");
-			timer.schedule(new TimerTask() {
-
-				@Override
-				public void run() {
-					try {
-						commit();
-					} catch (Throwable t) {
-						logger.error(t.getMessage());
-					}
-				}
-			}, luceneCommitMillis, luceneCommitMillis);
+			timer.schedule(new CommitTimerTask(), luceneCommitMillis, luceneCommitMillis);
 
 		} catch (Exception e) {
 			logger.error(fatal, e.getMessage());
@@ -614,6 +610,17 @@ public class Lucene {
 		}
 
 		logger.info("Initialised icat.lucene");
+	}
+
+	class CommitTimerTask extends TimerTask {
+		@Override
+		public void run() {
+			try {
+				commit();
+			} catch (Throwable t) {
+				logger.error(t.getMessage());
+			}
+		}
 	}
 
 	@POST
@@ -658,8 +665,8 @@ public class Lucene {
 
 				if (o.containsKey("params")) {
 					JsonArray params = o.getJsonArray("params");
-
 					IndexSearcher investigationParameterSearcher = getSearcher(map, "InvestigationParameter");
+
 					for (JsonValue p : params) {
 						BooleanQuery.Builder paramQuery = parseParameter(p);
 						Query toQuery = JoinUtil.createJoinQuery("investigation", false, "id", paramQuery.build(),
@@ -671,6 +678,7 @@ public class Lucene {
 				if (o.containsKey("samples")) {
 					JsonArray samples = o.getJsonArray("samples");
 					IndexSearcher sampleSearcher = getSearcher(map, "Sample");
+
 					for (JsonValue s : samples) {
 						JsonString sample = (JsonString) s;
 						BooleanQuery.Builder sampleQuery = new BooleanQuery.Builder();
@@ -693,7 +701,8 @@ public class Lucene {
 
 				search.query = maybeEmptyQuery(theQuery);
 			}
-			return luceneSearchResult("Dataset", search, maxResults, uid);
+			logger.info("Query: {}", search.query);
+			return luceneSearchResult("Investigation", search, maxResults, uid);
 		} catch (Exception e) {
 			logger.error("Error", e);
 			freeSearcher(uid);
@@ -738,7 +747,8 @@ public class Lucene {
 
 	private String luceneSearchResult(String name, Search search, int maxResults, Long uid) throws IOException {
 		IndexSearcher isearcher = getSearcher(search.map, name);
-		logger.debug("To search {} {} with {} from {} ", search.query, maxResults, isearcher, search.lastDoc);
+		logger.debug("To search in {} for {} {} with {} from {} ", name, search.query, maxResults, isearcher,
+				search.lastDoc);
 		TopDocs topDocs = search.lastDoc == null ? isearcher.search(search.query, maxResults)
 				: isearcher.searchAfter(search.lastDoc, search.query, maxResults);
 		ScoreDoc[] hits = topDocs.scoreDocs;
