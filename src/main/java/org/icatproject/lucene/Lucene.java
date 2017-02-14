@@ -43,6 +43,7 @@ import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
 
 import org.apache.lucene.document.Document;
+import org.apache.lucene.document.DoubleField;
 import org.apache.lucene.document.Field.Store;
 import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.StringField;
@@ -86,7 +87,7 @@ public class Lucene {
 	}
 
 	enum FieldType {
-		TextField, StringField, SortedDocValuesField
+		TextField, StringField, SortedDocValuesField, DoubleField
 	}
 
 	private class IndexBucket {
@@ -154,6 +155,7 @@ public class Lucene {
 		FieldType fType = null;
 		String name = null;
 		String value = null;
+		Double dvalue = null;
 		Store store = Store.NO;
 		Document doc = new Document();
 
@@ -186,8 +188,11 @@ public class Lucene {
 				long num = parser.getLong();
 				if (fType == FieldType.SortedDocValuesField) {
 					value = Long.toString(num);
+				} else if (fType == FieldType.DoubleField) {
+					dvalue = parser.getBigDecimal().doubleValue();
 				} else {
-					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST, "Bad VALUE_NUMBER " + attName);
+					throw new LuceneException(HttpURLConnection.HTTP_BAD_REQUEST,
+							"Bad VALUE_NUMBER " + attName + " " + fType);
 				}
 			} else if (ev == Event.VALUE_TRUE) {
 				if (attName == AttributeName.store) {
@@ -207,15 +212,15 @@ public class Lucene {
 					doc.add(new StringField(name, value, store));
 				} else if (fType == FieldType.SortedDocValuesField) {
 					doc.add(new SortedDocValuesField(name, new BytesRef(value)));
+				} else if (fType == FieldType.DoubleField) {
+					doc.add(new DoubleField(name, dvalue, store));
 				}
-
 			} else if (ev == Event.END_ARRAY) {
 				if (id == null) {
 					if (bucket.locked.get() && when == When.Sometime) {
 						bucket.docsToAdd.add(doc);
 						logger.trace("Will add to {} lucene index later", entityName);
 					} else {
-						logger.trace("Adding {} to {} lucene index", doc, entityName);
 						bucket.indexWriter.addDocument(doc);
 					}
 				} else {
@@ -266,7 +271,7 @@ public class Lucene {
 	@POST
 	@Path("clear")
 	public void clear() throws LuceneException {
-		logger.debug("Requesting clear");
+		logger.info("Requesting clear");
 
 		exit();
 		timer = new Timer("LuceneCommitTimer");
@@ -285,6 +290,7 @@ public class Lucene {
 		}
 
 		timer.schedule(new CommitTimerTask(), luceneCommitMillis, luceneCommitMillis);
+		logger.info("clear complete - ready to go again");
 
 	}
 
@@ -315,8 +321,6 @@ public class Lucene {
 			IndexBucket bucket = new IndexBucket();
 			FSDirectory directory = FSDirectory.open(Paths.get(luceneDirectory, name));
 			bucket.directory = directory;
-			logger.debug("Opened FSDirectory {}", directory);
-
 			IndexWriterConfig config = new IndexWriterConfig(analyzer);
 			IndexWriter iwriter = new IndexWriter(directory, config);
 			String[] files = directory.listAll();
@@ -346,6 +350,7 @@ public class Lucene {
 	@Path("datafiles")
 	public String datafiles(@Context HttpServletRequest request, @QueryParam("maxResults") int maxResults)
 			throws LuceneException {
+
 		Long uid = null;
 		try {
 			uid = bucketNum.getAndIncrement();

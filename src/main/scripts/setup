@@ -12,7 +12,7 @@ def uninstall():
 actions, arg, props = getActions("lucene-setup.properties", [])
 
 prop_name = "lucene.properties"
-prop_list = ["directory", "commitSeconds", "commitCount"]
+prop_list = ["directory", "commitSeconds", "ip"]
 
 if arg in ["CONFIGURE", "INSTALL"]: actions.configure(prop_name, prop_list) 
 luceneProperties = getProperties(prop_name, prop_list)

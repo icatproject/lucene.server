@@ -20,10 +20,6 @@
 			href="https://icatproject.org/installation/glassfish/">Glassfish
 				installation instructions</a> are available.
 		</li>
-		<li>A database as described in <a
-			href="https://icatproject.org/installation/database/">Database
-				installation instructions</a> installed on the server
-		</li>
 
 		<li>Python (version 2.4 to 2.7)</li>
 
@@ -59,22 +55,21 @@
 	<h2>The lucene.properties file</h2>
 
 	<dl>
-
 		<dt>directory</dt>
 		<dd>The path to a directory (whose parent must exist) in which to
 			store the lucene index.</dd>
 
 		<dt>commitSeconds</dt>
 		<dd>the interval in seconds between committing lucene changes to
-			disk and updating the index. If you set it to 300 then searchText()
-			calls will see what was available at some time in the past (up to 5
-			minutes ago) and which is also currently present.</dd>
+			disk and updating the index.</dd>
 
-		<dt>commitCount</dt>
-		<dd>the number of changes to accumulate before committing them to
-			disk. If the number is too high there can be memory problems.
-			Currently this is only used by the call to lucenePopulate.</dd>
-
+		<dt>ip</dt>
+		<dd>Ranges of ip addresses to accept requests from. This should
+			be as restrictive as possible - just list the icats you need to
+			listen to. Provide a space separated list of allowed values. These
+			take the form of an IPV4 or IPV6 address followed by the number of
+			bits (starting from the most significant) to consider. For example
+			127.0.0.1/32 is the IPV4 value for localhost.</dd>
 	</dl>
 
 </body>
