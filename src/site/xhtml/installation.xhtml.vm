@@ -27,7 +27,7 @@
 
 
 
-	<h2>The lucene-setup.properties file</h2>
+	<h2>The setup.properties file</h2>
 	<dl>
 		<dt>container</dt>
 		<dd>
@@ -52,7 +52,7 @@
 	<p>If you wish to modify the provided logging levels then rename
 		logback.xml.example to logback.xml and edit to suit.</p>
 
-	<h2>The lucene.properties file</h2>
+	<h2>The run.properties file</h2>
 
 	<dl>
 		<dt>directory</dt>

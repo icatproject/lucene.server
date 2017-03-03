@@ -29,7 +29,7 @@ public class AddressFilter implements ContainerRequestFilter {
 	static {
 		CheckedProperties props = new CheckedProperties();
 		try {
-			props.loadFromFile("lucene.properties");
+			props.loadFromResource("run.properties");
 			addressChecker = new AddressChecker(props.getString("ip"));
 		} catch (Exception e) {
 			logger.error(fatal, e.getMessage());

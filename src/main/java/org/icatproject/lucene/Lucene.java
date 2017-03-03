@@ -11,7 +11,6 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
@@ -94,10 +93,7 @@ public class Lucene {
 		private FSDirectory directory;
 		private IndexWriter indexWriter;
 		private SearcherManager searcherManager;
-		private Set<Long> docsToDelete = ConcurrentHashMap.newKeySet();
-		private Set<Document> docsToAdd = ConcurrentHashMap.newKeySet();
 		private AtomicBoolean locked = new AtomicBoolean();
-		public Map<Long, Document> docsToUpdate = new ConcurrentHashMap<>();
 	}
 
 	public class Search {
@@ -127,6 +123,24 @@ public class Lucene {
 	private IcatAnalyzer analyzer;
 
 	private Map<Long, Search> searches = new ConcurrentHashMap<>();
+
+	/**
+	 * return the version of the lucene server
+	 * 
+	 * @summary Version
+	 * 
+	 * @return json string of the form: <samp>{"version":"4.4.0"}</samp>
+	 */
+	@GET
+	@Path("version")
+	@Produces(MediaType.APPLICATION_JSON)
+	public String getVersion() {
+		ByteArrayOutputStream baos = new ByteArrayOutputStream();
+		JsonGenerator gen = Json.createGenerator(baos);
+		gen.writeStartObject().write("version", Constants.API_VERSION).writeEnd();
+		gen.close();
+		return baos.toString();
+	}
 
 	/*
 	 * Expect an array of things to add to a single document
@@ -218,17 +232,16 @@ public class Lucene {
 			} else if (ev == Event.END_ARRAY) {
 				if (id == null) {
 					if (bucket.locked.get() && when == When.Sometime) {
-						bucket.docsToAdd.add(doc);
-						logger.trace("Will add to {} lucene index later", entityName);
-					} else {
-						bucket.indexWriter.addDocument(doc);
+						throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE,
+								"Lucene locked for " + entityName);
 					}
+					bucket.indexWriter.addDocument(doc);
 				} else {
 					if (bucket.locked.get()) {
-						bucket.docsToUpdate.put(id, doc);
-					} else {
-						bucket.indexWriter.updateDocument(new Term("id", id.toString()), doc);
+						throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE,
+								"Lucene locked for " + entityName);
 					}
+					bucket.indexWriter.updateDocument(new Term("id", id.toString()), doc);
 				}
 				return;
 			} else {
@@ -523,11 +536,9 @@ public class Lucene {
 		try {
 			IndexBucket bucket = indexBuckets.computeIfAbsent(entityName, k -> createBucket(k));
 			if (bucket.locked.get()) {
-				bucket.docsToDelete.add(id);
-				logger.trace("Will delete from {} lucene index later", entityName);
-			} else {
-				bucket.indexWriter.deleteDocuments(new Term("id", Long.toString(id)));
+				throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE, "Lucene locked for " + entityName);
 			}
+			bucket.indexWriter.deleteDocuments(new Term("id", Long.toString(id)));
 		} catch (IOException e) {
 			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
@@ -593,7 +604,7 @@ public class Lucene {
 		logger.info("Initialising icat.lucene");
 		CheckedProperties props = new CheckedProperties();
 		try {
-			props.loadFromFile("lucene.properties");
+			props.loadFromResource("run.properties");
 
 			luceneDirectory = props.getString("directory");
 
@@ -827,27 +838,10 @@ public class Lucene {
 	public void unlock(@PathParam("entityName") String entityName) throws LuceneException {
 		logger.debug("Requesting unlock of {} index", entityName);
 		IndexBucket bucket = indexBuckets.computeIfAbsent(entityName, k -> createBucket(k));
-		try {
-			for (Document doc : bucket.docsToAdd) {
-				bucket.indexWriter.addDocument(doc);
-			}
-			bucket.docsToAdd.clear();
-			for (Entry<Long, Document> entry : bucket.docsToUpdate.entrySet()) {
-				bucket.indexWriter.updateDocument(new Term("id", entry.getKey().toString()), entry.getValue());
-			}
-			bucket.docsToUpdate.clear();
-			for (Long id : bucket.docsToDelete) {
-				bucket.indexWriter.deleteDocuments(new Term("id", id.toString()));
-			}
-			bucket.docsToDelete.clear();
-		} catch (IOException e) {
-			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
-		}
 		if (!bucket.locked.compareAndSet(true, false)) {
 			throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE,
 					"Lucene is not currently locked for " + entityName);
 		}
-
 		try {
 			int cached = bucket.indexWriter.numRamDocs();
 			bucket.indexWriter.commit();

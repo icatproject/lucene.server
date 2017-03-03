@@ -9,9 +9,9 @@ def uninstall():
     app = actions.getAppName("icat.lucene")
     if app: actions.undeploy(app)
     
-actions, arg, props = getActions("lucene-setup.properties", [])
+actions, arg, props = getActions("setup.properties", [])
 
-prop_name = "lucene.properties"
+prop_name = "run.properties"
 prop_list = ["directory", "commitSeconds", "ip"]
 
 if arg in ["CONFIGURE", "INSTALL"]: actions.configure(prop_name, prop_list) 
@@ -21,20 +21,17 @@ if arg in ["CONFIGURE", "INSTALL"]:
     actions.checkNoErrors()
 
 if arg == "INSTALL":           
-       
-    actions.installFile("lucene.properties")
-    
+           
     try:           
         uninstall()
-        ovfiles = []
+        ovfiles = [[prop_name, "WEB-INF/classes"]]
         if os.path.exists("logback.xml"): ovfiles.append(["logback.xml", "WEB-INF/classes"])
         actions.deploy(deploymentorder=80, files=ovfiles)
     except Exception, e:
         abort(str(e))
                 
 if arg == "UNINSTALL":        
-    actions.removeFile(prop_name)
- 
+
     try:
         uninstall()
     except Exception, e:
