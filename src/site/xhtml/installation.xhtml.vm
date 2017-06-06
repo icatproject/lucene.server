@@ -15,17 +15,13 @@
 		</li>
 		<li>Java 8</li>
 		<li>A suitable deployed container. The installation scripts
-			support Glassfish and to a lesser extent WildFly. Testing has been
-			carried out with Glassfish 4.0. <a
+			support Glassfish/Payara and to a lesser extent WildFly. Testing has
+			been carried out with Payara41 and Glassfish 4.0<a
 			href="https://icatproject.org/installation/glassfish/">Glassfish
 				installation instructions</a> are available.
 		</li>
-
 		<li>Python (version 2.4 to 2.7)</li>
-
 	</ul>
-
-
 
 	<h2>The setup.properties file</h2>
 	<dl>
