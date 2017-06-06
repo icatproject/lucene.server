@@ -126,10 +126,6 @@ public class Lucene {
 
 	/**
 	 * return the version of the lucene server
-	 * 
-	 * @summary Version
-	 * 
-	 * @return json string of the form: <samp>{"version":"4.4.0"}</samp>
 	 */
 	@GET
 	@Path("version")
@@ -142,7 +138,7 @@ public class Lucene {
 		return baos.toString();
 	}
 
-	/*
+	/**
 	 * Expect an array of things to add to a single document
 	 */
 	@POST
@@ -250,7 +246,7 @@ public class Lucene {
 		}
 	}
 
-	/*
+	/**
 	 * Expect an array of documents each encoded as an array of things to add to
 	 * the document
 	 */
