@@ -627,6 +627,9 @@ public class Lucene {
 			props.loadFromResource("run.properties");
 
 			luceneDirectory = props.getPath("directory");
+			if (!luceneDirectory.toFile().isDirectory()) {
+				throw new Exception(luceneDirectory + " is not a directory");
+			}
 
 			luceneCommitMillis = props.getPositiveInt("commitSeconds") * 1000;
 
