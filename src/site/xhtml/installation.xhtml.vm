@@ -53,7 +53,7 @@
 	<dl>
 		<dt>directory</dt>
 		<dd>The path to a directory (whose parent must exist) in which to
-			store the lucene index.</dd>
+			store the lucene index. Any environment variables will be respected.</dd>
 
 		<dt>commitSeconds</dt>
 		<dd>the interval in seconds between committing lucene changes to

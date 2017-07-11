@@ -6,7 +6,6 @@ import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
@@ -110,7 +109,7 @@ public class Lucene {
 
 	private static final Marker fatal = MarkerFactory.getMarker("FATAL");
 
-	private String luceneDirectory;
+	private java.nio.file.Path luceneDirectory;
 
 	private int luceneCommitMillis;
 
@@ -139,20 +138,61 @@ public class Lucene {
 	}
 
 	/**
-	 * Expect an array of things to add to a single document
+	 * Expect an array of things to add, update or delete to multiple documents
 	 */
 	@POST
 	@Consumes(MediaType.APPLICATION_JSON)
-	@Path("add/{entityName}")
-	public void add(@Context HttpServletRequest request, @PathParam("entityName") String entityName)
-			throws LuceneException {
-		logger.debug("Requesting add of {}", entityName);
+	@Path("modify")
+	public void modify(@Context HttpServletRequest request) throws LuceneException {
+
+		logger.debug("Requesting modify");
+		int count = 0;
+
 		try (JsonParser parser = Json.createParser(request.getInputStream())) {
-			parser.next(); // Skip the opening [
-			add(request, entityName, When.Sometime, parser, null);
+
+			Event ev = parser.next();
+			if (ev != Event.START_ARRAY) {
+				throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, "Unexpected " + ev.name());
+			}
+			ev = parser.next();
+
+			while (true) {
+				if (ev == Event.END_ARRAY) {
+					break;
+				}
+				if (ev != Event.START_ARRAY) {
+					throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, "Unexpected " + ev.name());
+				}
+				ev = parser.next();
+				String entityName = parser.getString();
+				ev = parser.next();
+				Long id = (ev == Event.VALUE_NULL) ? null : parser.getLong();
+				ev = parser.next();
+				if (ev == Event.VALUE_NULL) {
+					try {
+						IndexBucket bucket = indexBuckets.computeIfAbsent(entityName, k -> createBucket(k));
+						if (bucket.locked.get()) {
+							throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE,
+									"Lucene locked for " + entityName);
+						}
+						bucket.indexWriter.deleteDocuments(new Term("id", Long.toString(id)));
+					} catch (IOException e) {
+						throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
+					}
+				} else {
+					add(request, entityName, When.Sometime, parser, id);
+				}
+				ev = parser.next(); // end of triple
+				count++;
+				ev = parser.next(); // either end of input or start of new
+									// triple
+			}
+
 		} catch (IOException e) {
 			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}
+		logger.debug("Modified {} documents", count);
+
 	}
 
 	/* if id is not null this is actually an update */
@@ -289,13 +329,11 @@ public class Lucene {
 		indexBuckets.clear();
 		searches.clear();
 
-		java.nio.file.Path dir = Paths.get(luceneDirectory);
 		try {
-			Files.walk(dir, FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder()).filter(f -> !dir.equals(f))
-					.map(java.nio.file.Path::toFile).forEach(File::delete);
+			Files.walk(luceneDirectory, FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder())
+					.filter(f -> !luceneDirectory.equals(f)).map(java.nio.file.Path::toFile).forEach(File::delete);
 		} catch (IOException e) {
 			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
-
 		}
 
 		timer.schedule(new CommitTimerTask(), luceneCommitMillis, luceneCommitMillis);
@@ -328,7 +366,7 @@ public class Lucene {
 	private IndexBucket createBucket(String name) {
 		try {
 			IndexBucket bucket = new IndexBucket();
-			FSDirectory directory = FSDirectory.open(Paths.get(luceneDirectory, name));
+			FSDirectory directory = FSDirectory.open(luceneDirectory.resolve(name));
 			bucket.directory = directory;
 			IndexWriterConfig config = new IndexWriterConfig(analyzer);
 			IndexWriter iwriter = new IndexWriter(directory, config);
@@ -526,20 +564,6 @@ public class Lucene {
 		}
 	}
 
-	@DELETE
-	@Path("delete/{entityName}/{id}")
-	public void delete(@PathParam("entityName") String entityName, @PathParam("id") long id) throws LuceneException {
-		try {
-			IndexBucket bucket = indexBuckets.computeIfAbsent(entityName, k -> createBucket(k));
-			if (bucket.locked.get()) {
-				throw new LuceneException(HttpURLConnection.HTTP_NOT_ACCEPTABLE, "Lucene locked for " + entityName);
-			}
-			bucket.indexWriter.deleteDocuments(new Term("id", Long.toString(id)));
-		} catch (IOException e) {
-			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
-		}
-	}
-
 	@PreDestroy
 	private void exit() {
 		logger.info("Closing down icat.lucene");
@@ -602,7 +626,7 @@ public class Lucene {
 		try {
 			props.loadFromResource("run.properties");
 
-			luceneDirectory = props.getString("directory");
+			luceneDirectory = props.getPath("directory");
 
 			luceneCommitMillis = props.getPositiveInt("commitSeconds") * 1000;
 
@@ -846,23 +870,6 @@ public class Lucene {
 						entityName, bucket.indexWriter.numDocs());
 			}
 			bucket.searcherManager.maybeRefreshBlocking();
-		} catch (IOException e) {
-			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
-		}
-	}
-
-	/*
-	 * Expect an array of things to update a single document
-	 */
-	@POST
-	@Consumes(MediaType.APPLICATION_JSON)
-	@Path("update/{entityName}/{id}")
-	public void update(@Context HttpServletRequest request, @PathParam("entityName") String entityName,
-			@PathParam("id") long id) throws LuceneException {
-		logger.debug("Requesting update of {}", entityName);
-		try (JsonParser parser = Json.createParser(request.getInputStream())) {
-			parser.next(); // Skip the opening [
-			add(request, entityName, When.Sometime, parser, id);
 		} catch (IOException e) {
 			throw new LuceneException(HttpURLConnection.HTTP_INTERNAL_ERROR, e.getMessage());
 		}

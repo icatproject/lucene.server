@@ -19,9 +19,11 @@
 		</encoder>
 	</appender>
 
-	<root level="INFO">
+	<root level="DEBUG">
 		<appender-ref ref="FILE" />
 	</root>
+
+	<logger name="org.icatproject.core.manager.LuceneManager" level="trace" />
 
 </configuration>
 
