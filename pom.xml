@@ -14,7 +14,7 @@
 		<repoUrl>https://repo.icatproject.org/repo</repoUrl>
 		<project.scm.id>github</project.scm.id>
 		<gitUrl>https://github.com/icatproject/icat.lucene</gitUrl>
-		<luceneVersion>5.3.0</luceneVersion>
+		<luceneVersion>8.6.0</luceneVersion>
 	</properties>
 
 	<repositories>
