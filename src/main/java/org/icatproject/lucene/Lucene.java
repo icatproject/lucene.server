@@ -434,9 +434,7 @@ public class Lucene {
 				String lower = o.getString("lower", null);
 				String upper = o.getString("upper", null);
 				if (lower != null && upper != null) {
-					theQuery.add(new TermRangeQuery("startDate", new BytesRef(lower), new BytesRef(upper), true, true),
-							Occur.MUST);
-					theQuery.add(new TermRangeQuery("endDate", new BytesRef(lower), new BytesRef(upper), true, true),
+					theQuery.add(new TermRangeQuery("date", new BytesRef(lower), new BytesRef(upper), true, true),
 							Occur.MUST);
 				}
 
